@@ -17,3 +17,5 @@ data/gold/
 logs/*.log
 data/quarantine/
 reports/quality_report.json
+data/state/
+reports/run_history.json

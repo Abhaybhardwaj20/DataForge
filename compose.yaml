@@ -1,0 +1,15 @@
+services:
+  dataforge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: dataforge:local
+    volumes:
+      - ./data/raw:/app/data/raw:ro
+      - ./data/bronze:/app/data/bronze
+      - ./data/silver:/app/data/silver
+      - ./data/gold:/app/data/gold
+      - ./data/quarantine:/app/data/quarantine
+      - ./data/state:/app/data/state
+      - ./reports:/app/reports
+      - ./logs:/app/logs
