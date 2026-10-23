@@ -14,6 +14,7 @@ from quality import (
     build_quality_report,
     save_quality_report,
 )
+from quarantine import split_valid_and_invalid_orders, save_quarantine
 
 
 def setup_logging(project_root: Path) -> None:
@@ -24,10 +25,7 @@ def setup_logging(project_root: Path) -> None:
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
         handlers=[
-            logging.FileHandler(
-                log_dir / "dataforge.log",
-                encoding="utf-8",
-            ),
+            logging.FileHandler(log_dir / "dataforge.log", encoding="utf-8"),
             logging.StreamHandler(),
         ],
         force=True,
@@ -41,7 +39,6 @@ def run_pipeline() -> None:
 
     try:
         config_file = project_root / "config" / "config.yaml"
-
         with config_file.open("r", encoding="utf-8") as file:
             config = yaml.safe_load(file)
 
@@ -49,25 +46,44 @@ def run_pipeline() -> None:
         bronze_file = project_root / config["data"]["bronze_path"]
         silver_file = project_root / config["data"]["silver_path"]
         gold_file = project_root / config["data"]["gold_path"]
+        quarantine_file = project_root / "data" / "quarantine" / "invalid_orders.parquet"
 
         logger.info("Starting %s pipeline", config["project"]["name"])
 
         orders = load_orders(raw_file)
-        validate_orders(orders)
-        logger.info("Loaded and validated %s raw rows", len(orders))
+        logger.info("Loaded %s raw rows", len(orders))
 
+        # Preserve the original input in Bronze.
         publish_orders(orders, bronze_file)
 
-        silver_orders = transform_orders(orders)
+        # Separate invalid records instead of rejecting the entire batch.
+        valid_orders, invalid_orders = split_valid_and_invalid_orders(orders)
+        save_quarantine(invalid_orders, quarantine_file)
+
+        logger.info(
+            "Record split complete: %s valid, %s quarantined",
+            len(valid_orders),
+            len(invalid_orders),
+        )
+
+        if valid_orders.empty:
+            raise ValueError(
+                "No valid orders remain after quarantine; Silver and Gold were not generated."
+            )
+
+        validate_orders(valid_orders)
+
+        silver_orders = transform_orders(valid_orders)
         publish_orders(silver_orders, silver_file)
 
-        # Save the reusable data-quality report.
         quality_summary = build_quality_report(orders, silver_orders)
+        quality_summary["quarantined_rows"] = int(len(invalid_orders))
+        quality_summary["valid_rows_before_transform"] = int(len(valid_orders))
+
         report_file = project_root / "reports" / "quality_report.json"
         save_quality_report(quality_summary, report_file)
         logger.info("Data quality summary: %s", quality_summary)
 
-        # Generate Gold analytics.
         gold_file.parent.mkdir(parents=True, exist_ok=True)
         connection = duckdb.connect()
 
@@ -78,7 +94,6 @@ def run_pipeline() -> None:
             connection.execute(
                 f"CREATE VIEW orders AS SELECT * FROM read_parquet('{silver_path}')"
             )
-
             connection.execute(
                 f"""
                 COPY (
@@ -95,14 +110,12 @@ def run_pipeline() -> None:
             gold_count = connection.execute(
                 f"SELECT COUNT(*) FROM read_parquet('{gold_path}')"
             ).fetchone()[0]
-
             logger.info("Gold analytics generated: %s products", gold_count)
-
         finally:
             connection.close()
 
-        # Verify output files.
         file_report = check_pipeline_files(project_root)
+        file_report["Quarantine"] = quarantine_file.is_file()
 
         for layer, exists in file_report.items():
             if not exists:
