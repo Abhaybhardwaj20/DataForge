@@ -1,0 +1,129 @@
+
+import sys
+from pathlib import Path
+
+import pandas as pd
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from dataforge.transform import transform_orders
+from dataforge.validate import validate_orders
+
+
+def sample_orders():
+    return pd.DataFrame({
+        "order_id": [1001],
+        "customer_id": ["C101"],
+        "product": ["Laptop"],
+        "quantity": [2],
+        "price": [55000],
+        "order_date": ["2026-10-20"],
+        "status": ["Completed"],
+    })
+
+
+def test_total_amount_calculation():
+    result = transform_orders(sample_orders())
+    assert result.loc[0, "total_amount"] == 110000
+
+
+def test_order_date_is_datetime():
+    result = transform_orders(sample_orders())
+    assert pd.api.types.is_datetime64_any_dtype(result["order_date"])
+
+
+def test_validation_accepts_valid_orders():
+    validate_orders(sample_orders())
+
+
+def test_duplicate_orders_are_removed():
+    df = pd.concat([sample_orders(), sample_orders()], ignore_index=True)
+    result = transform_orders(df)
+    assert len(result) == 1
+    assert result["order_id"].is_unique
+
+
+def test_invalid_quantity_is_removed():
+    df = sample_orders()
+    df.loc[0, "quantity"] = 0
+    assert transform_orders(df).empty
+
+
+def test_valid_orders_are_preserved():
+    df = pd.concat(
+        [sample_orders(), sample_orders().assign(order_id=1002)],
+        ignore_index=True,
+    )
+    result = transform_orders(df)
+    assert len(result) == 2
+    assert result["order_id"].is_unique
+    assert (result["quantity"] > 0).all()
+
+
+def test_validation_rejects_missing_columns():
+    df = pd.DataFrame({
+        "order_id": [1001],
+        "customer_id": ["C101"],
+    })
+    with pytest.raises(ValueError, match="Missing columns"):
+        validate_orders(df)
+
+
+def test_gold_output_file_exists():
+    project_root = Path(__file__).resolve().parents[1]
+    gold_file = project_root / "data" / "gold" / "product_revenue.parquet"
+    assert gold_file.exists()
+
+
+def test_negative_price_is_removed():
+    df = sample_orders()
+    df.loc[0, "price"] = -100
+    assert transform_orders(df).empty
+
+
+def test_missing_order_id_is_removed():
+    df = sample_orders()
+    df.loc[0, "order_id"] = None
+    assert transform_orders(df).empty
+
+
+def test_invalid_date_is_removed():
+    df = sample_orders()
+    df.loc[0, "order_date"] = "not-a-date"
+    assert transform_orders(df).empty
+
+
+def test_whitespace_is_removed_from_text_fields():
+    df = sample_orders()
+    df.loc[0, "customer_id"] = " C101 "
+    df.loc[0, "product"] = " Laptop "
+    df.loc[0, "status"] = " completed "
+
+    result = transform_orders(df)
+    assert result.loc[0, "customer_id"] == "C101"
+    assert result.loc[0, "product"] == "Laptop"
+    assert result.loc[0, "status"] == "Completed"
+
+
+def test_total_amount_for_multiple_units():
+    df = sample_orders()
+    df.loc[0, "quantity"] = 3
+    df.loc[0, "price"] = 500
+
+    result = transform_orders(df)
+    assert result.loc[0, "total_amount"] == 1500
+
+
+def test_completed_revenue_excludes_cancelled_orders():
+    df = pd.DataFrame({
+        "product": ["Laptop", "Mouse", "Keyboard"],
+        "quantity": [1, 2, 1],
+        "price": [55000, 500, 1500],
+        "status": ["Completed", "Cancelled", "Completed"],
+    })
+
+    completed = df[df["status"] == "Completed"]
+    revenue = (completed["quantity"] * completed["price"]).sum()
+
+    assert revenue == 56500

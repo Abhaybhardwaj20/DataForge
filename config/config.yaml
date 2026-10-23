@@ -1,0 +1,20 @@
+
+project:
+  name: DataForge
+  environment: local
+
+data:
+  raw_path: data/raw/orders.csv
+  bronze_path: data/bronze/orders.parquet
+  silver_path: data/silver/orders.parquet
+  gold_path: data/gold/product_revenue.parquet
+
+validation:
+  reject_duplicate_order_ids: true
+  reject_missing_required_values: true
+  reject_non_positive_quantity: true
+  reject_negative_price: true
+
+pipeline:
+  output_format: parquet
+  analytics_engine: duckdb
