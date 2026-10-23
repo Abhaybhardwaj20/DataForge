@@ -15,6 +15,7 @@ from quality import (
     save_quality_report,
 )
 from quarantine import split_valid_and_invalid_orders, save_quarantine
+from incremental import load_processed_ids, split_new_orders, save_processed_ids
 
 
 def setup_logging(project_root: Path) -> None:
@@ -46,7 +47,15 @@ def run_pipeline() -> None:
         bronze_file = project_root / config["data"]["bronze_path"]
         silver_file = project_root / config["data"]["silver_path"]
         gold_file = project_root / config["data"]["gold_path"]
-        quarantine_file = project_root / "data" / "quarantine" / "invalid_orders.parquet"
+        quarantine_file = project_root / config["data"]["quarantine_path"]
+        state_file = project_root / config["data"]["state_path"]
+
+        incremental_enabled = config["pipeline"].get(
+            "incremental_processing", False
+        )
+        incremental_key = config["pipeline"].get(
+            "incremental_key", "order_id"
+        )
 
         logger.info("Starting %s pipeline", config["project"]["name"])
 
@@ -56,34 +65,68 @@ def run_pipeline() -> None:
         # Preserve the original input in Bronze.
         publish_orders(orders, bronze_file)
 
-        # Separate invalid records instead of rejecting the entire batch.
+        # Separate invalid records before incremental processing.
         valid_orders, invalid_orders = split_valid_and_invalid_orders(orders)
         save_quarantine(invalid_orders, quarantine_file)
 
         logger.info(
-            "Record split complete: %s valid, %s quarantined",
+            "Validation split: %s valid, %s quarantined",
             len(valid_orders),
             len(invalid_orders),
         )
 
-        if valid_orders.empty:
-            raise ValueError(
-                "No valid orders remain after quarantine; Silver and Gold were not generated."
+        if incremental_enabled:
+            processed_ids = load_processed_ids(state_file)
+            new_orders, skipped_orders = split_new_orders(
+                valid_orders,
+                processed_ids,
+                key=incremental_key,
             )
+            logger.info(
+                "Incremental split: %s new, %s previously processed",
+                len(new_orders),
+                len(skipped_orders),
+            )
+        else:
+            processed_ids = set()
+            new_orders = valid_orders.copy()
+            skipped_orders = valid_orders.iloc[0:0].copy()
 
-        validate_orders(valid_orders)
+        # If there are no new records, preserve existing Silver and Gold outputs.
+        if new_orders.empty:
+            logger.info("No new valid orders to process")
 
-        silver_orders = transform_orders(valid_orders)
-        publish_orders(silver_orders, silver_file)
+            quality_summary = build_quality_report(orders, valid_orders)
+            quality_summary["quarantined_rows"] = int(len(invalid_orders))
+            quality_summary["new_rows"] = 0
+            quality_summary["skipped_rows"] = int(len(skipped_orders))
 
-        quality_summary = build_quality_report(orders, silver_orders)
-        quality_summary["quarantined_rows"] = int(len(invalid_orders))
-        quality_summary["valid_rows_before_transform"] = int(len(valid_orders))
+            report_file = project_root / "reports" / "quality_report.json"
+            save_quality_report(quality_summary, report_file)
+            logger.info("DataForge pipeline completed with no new records")
+            return
 
-        report_file = project_root / "reports" / "quality_report.json"
-        save_quality_report(quality_summary, report_file)
-        logger.info("Data quality summary: %s", quality_summary)
+        validate_orders(new_orders)
 
+        new_silver = transform_orders(new_orders)
+
+        # Merge new transformed records with the existing Silver dataset.
+        if silver_file.exists():
+            existing_silver = __import__("pandas").read_parquet(silver_file)
+            combined_silver = __import__("pandas").concat(
+                [existing_silver, new_silver],
+                ignore_index=True,
+            )
+            combined_silver = combined_silver.drop_duplicates(
+                subset=[incremental_key],
+                keep="first",
+            )
+        else:
+            combined_silver = new_silver
+
+        publish_orders(combined_silver, silver_file)
+
+        # Generate Gold from the complete Silver dataset.
         gold_file.parent.mkdir(parents=True, exist_ok=True)
         connection = duckdb.connect()
 
@@ -106,13 +149,25 @@ def run_pipeline() -> None:
                 TO '{gold_path}' (FORMAT PARQUET)
                 """
             )
-
-            gold_count = connection.execute(
-                f"SELECT COUNT(*) FROM read_parquet('{gold_path}')"
-            ).fetchone()[0]
-            logger.info("Gold analytics generated: %s products", gold_count)
         finally:
             connection.close()
+
+        # Update state only after Silver and Gold have been published successfully.
+        if incremental_enabled:
+            newly_processed_ids = set(new_orders[incremental_key].astype(str))
+            save_processed_ids(
+                state_file,
+                processed_ids | newly_processed_ids,
+            )
+
+        quality_summary = build_quality_report(orders, combined_silver)
+        quality_summary["quarantined_rows"] = int(len(invalid_orders))
+        quality_summary["new_rows"] = int(len(new_orders))
+        quality_summary["skipped_rows"] = int(len(skipped_orders))
+
+        report_file = project_root / "reports" / "quality_report.json"
+        save_quality_report(quality_summary, report_file)
+        logger.info("Data quality summary: %s", quality_summary)
 
         file_report = check_pipeline_files(project_root)
         file_report["Quarantine"] = quarantine_file.is_file()

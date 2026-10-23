@@ -8,6 +8,8 @@ data:
   bronze_path: data/bronze/orders.parquet
   silver_path: data/silver/orders.parquet
   gold_path: data/gold/product_revenue.parquet
+  quarantine_path: data/quarantine/invalid_orders.parquet
+  state_path: data/state/processed_orders.json
 
 validation:
   reject_duplicate_order_ids: true
@@ -18,3 +20,5 @@ validation:
 pipeline:
   output_format: parquet
   analytics_engine: duckdb
+  incremental_processing: true
+  incremental_key: order_id
