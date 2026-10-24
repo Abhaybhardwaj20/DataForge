@@ -13,9 +13,14 @@ sys.path.insert(0, str(DATAFORGE_SRC))
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 import dataforge.cli as cli
+from dataforge.incremental import load_processed_ids, save_processed_ids
+from dataforge.storage import StorageUploadError
 
 
-def test_successful_pipeline_records_run(monkeypatch, tmp_path):
+@pytest.mark.parametrize("storage_enabled", [False, True])
+def test_successful_pipeline_records_run(
+    monkeypatch, tmp_path, storage_enabled
+):
     """A no-new-records run should be recorded as successful."""
     project_root = tmp_path
     config_dir = project_root / "config"
@@ -46,9 +51,22 @@ def test_successful_pipeline_records_run(monkeypatch, tmp_path):
             "incremental_key": "order_id",
         },
     }
+    if storage_enabled:
+        config["storage"] = {
+            "enabled": True,
+            "endpoint_url": "http://object-storage:9000",
+            "bucket": "dataforge-learning-bucket",
+        }
 
     monkeypatch.setattr(cli, "setup_logging", lambda _: None)
     monkeypatch.setattr(cli.yaml, "safe_load", lambda _: config)
+    upload_calls = []
+    monkeypatch.delenv("DATAFORGE_S3_ENDPOINT", raising=False)
+    monkeypatch.setattr(
+        cli,
+        "upload_pipeline_outputs",
+        lambda *args, **kwargs: upload_calls.append((args, kwargs)),
+    )
 
     orders = pd.DataFrame(
         [{
@@ -125,6 +143,131 @@ def test_successful_pipeline_records_run(monkeypatch, tmp_path):
     assert record["skipped_rows"] == 1
     assert record["silver_rows"] == 1
     assert history_path == project_root / "reports" / "run_history.json"
+    if storage_enabled:
+        assert len(upload_calls) == 1
+        paths, options = upload_calls[0]
+        assert paths == (
+            project_root / "data" / "bronze" / "orders.parquet",
+            silver_file,
+            project_root / "data" / "gold" / "product_revenue.parquet",
+            project_root / "data" / "quarantine" / "invalid_orders.parquet",
+        )
+        assert options == {
+            "bucket": "dataforge-learning-bucket",
+            "endpoint_url": "http://object-storage:9000",
+        }
+    else:
+        assert upload_calls == []
+
+
+def prepare_new_order_pipeline(monkeypatch, project_root):
+    config_dir = project_root / "config"
+    config_dir.mkdir()
+    (config_dir / "config.yaml").write_text("placeholder", encoding="utf-8")
+
+    config = {
+        "project": {"name": "DataForge"},
+        "data": {
+            "raw_path": "orders.csv",
+            "bronze_path": "data/bronze/orders.parquet",
+            "silver_path": "data/silver/orders.parquet",
+            "gold_path": "data/gold/product_revenue.parquet",
+            "quarantine_path": "data/quarantine/invalid_orders.parquet",
+            "state_path": "data/state/processed_orders.json",
+        },
+        "pipeline": {
+            "incremental_processing": True,
+            "incremental_key": "order_id",
+        },
+        "storage": {
+            "enabled": True,
+            "endpoint_url": "http://object-storage:9000",
+            "bucket": "dataforge-learning-bucket",
+        },
+    }
+    monkeypatch.setattr(cli, "setup_logging", lambda _: None)
+    monkeypatch.setattr(cli.yaml, "safe_load", lambda _: config)
+    monkeypatch.delenv("DATAFORGE_S3_ENDPOINT", raising=False)
+    monkeypatch.setattr(
+        cli,
+        "load_orders",
+        lambda _: pd.DataFrame(
+            [{
+                "order_id": 1002,
+                "customer_id": "C102",
+                "product": "Mouse",
+                "quantity": 2,
+                "price": 500,
+                "order_date": "2026-10-23",
+                "status": "Completed",
+            }]
+        ),
+    )
+    state_file = project_root / "data" / "state" / "processed_orders.json"
+    save_processed_ids(state_file, {"1001"})
+    monkeypatch.setattr(
+        cli,
+        "__file__",
+        str(project_root / "src" / "dataforge" / "cli.py"),
+    )
+    return state_file
+
+
+def test_upload_failure_preserves_state_and_records_failed_run(
+    monkeypatch, tmp_path
+):
+    state_file = prepare_new_order_pipeline(monkeypatch, tmp_path)
+
+    def fail_upload(*args, **kwargs):
+        raise StorageUploadError("simulated local S3 outage")
+
+    monkeypatch.setattr(cli, "upload_pipeline_outputs", fail_upload)
+
+    with pytest.raises(StorageUploadError, match="simulated local S3 outage"):
+        cli.run_pipeline()
+
+    assert load_processed_ids(state_file) == {"1001"}
+    assert (tmp_path / "data" / "bronze" / "orders.parquet").is_file()
+    assert (tmp_path / "data" / "silver" / "orders.parquet").is_file()
+    assert (tmp_path / "data" / "gold" / "product_revenue.parquet").is_file()
+    assert (tmp_path / "data" / "quarantine" / "invalid_orders.parquet").is_file()
+
+    history = json.loads(
+        (tmp_path / "reports" / "run_history.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert history[-1]["status"] == "failed"
+    assert "simulated local S3 outage" in history[-1]["error"]
+
+
+def test_successful_upload_happens_before_state_persistence(
+    monkeypatch, tmp_path
+):
+    state_file = prepare_new_order_pipeline(monkeypatch, tmp_path)
+    upload_observations = []
+
+    def verify_upload_before_state(*args, **kwargs):
+        assert load_processed_ids(state_file) == {"1001"}
+        assert all(Path(path).is_file() for path in args)
+        upload_observations.append((args, kwargs))
+
+    monkeypatch.setattr(
+        cli,
+        "upload_pipeline_outputs",
+        verify_upload_before_state,
+    )
+
+    cli.run_pipeline()
+
+    assert len(upload_observations) == 1
+    assert load_processed_ids(state_file) == {"1001", "1002"}
+    history = json.loads(
+        (tmp_path / "reports" / "run_history.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert history[-1]["status"] == "success"
 
 
 def test_failed_pipeline_records_error(monkeypatch, tmp_path):

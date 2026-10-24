@@ -9,3 +9,4 @@ data/
 reports/
 logs/
 .env
+.env.*

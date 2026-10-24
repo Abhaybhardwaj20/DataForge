@@ -22,3 +22,8 @@ pipeline:
   analytics_engine: duckdb
   incremental_processing: true
   incremental_key: order_id
+
+storage:
+  enabled: true
+  endpoint_url: http://127.0.0.1:9000
+  bucket: dataforge-learning-bucket

@@ -1,5 +1,6 @@
 
 import logging
+import os
 from pathlib import Path
 
 import duckdb
@@ -22,6 +23,7 @@ from run_tracking import (
     finish_run_record,
     save_run_record,
 )
+from storage import upload_pipeline_outputs
 
 
 def setup_logging(project_root: Path) -> None:
@@ -58,12 +60,34 @@ def run_pipeline() -> None:
         with config_file.open("r", encoding="utf-8") as file:
             config = yaml.safe_load(file)
 
+        storage_config = config.get("storage", {})
+        storage_enabled = storage_config.get("enabled", False)
+
         raw_file = project_root / config["data"]["raw_path"]
         bronze_file = project_root / config["data"]["bronze_path"]
         silver_file = project_root / config["data"]["silver_path"]
         gold_file = project_root / config["data"]["gold_path"]
         quarantine_file = project_root / config["data"]["quarantine_path"]
         state_file = project_root / config["data"]["state_path"]
+
+        def upload_outputs() -> None:
+            if not storage_enabled:
+                return
+
+            endpoint_url = os.getenv(
+                "DATAFORGE_S3_ENDPOINT",
+                storage_config.get(
+                    "endpoint_url", "http://127.0.0.1:9000"
+                ),
+            )
+            upload_pipeline_outputs(
+                bronze_file,
+                silver_file,
+                gold_file,
+                quarantine_file,
+                bucket=storage_config.get("bucket", ""),
+                endpoint_url=endpoint_url,
+            )
 
         incremental_enabled = config["pipeline"].get(
             "incremental_processing", False
@@ -146,6 +170,7 @@ def run_pipeline() -> None:
             quality_summary["skipped_rows"] = int(len(skipped_orders))
 
             save_quality_report(quality_summary, report_file)
+            upload_outputs()
 
             finish_run_record(run_record, "success")
             save_run_record(run_record, history_file)
@@ -214,18 +239,7 @@ def run_pipeline() -> None:
         finally:
             connection.close()
 
-        # 10. Save incremental state after Silver and Gold publication.
-        if incremental_enabled:
-            newly_processed_ids = set(
-                new_orders[incremental_key].astype(str)
-            )
-
-            save_processed_ids(
-                state_file,
-                processed_ids | newly_processed_ids,
-            )
-
-        # 11. Save the data-quality report.
+        # 10. Save the data-quality report.
         quality_summary = build_quality_report(
             orders,
             combined_silver,
@@ -249,7 +263,20 @@ def run_pipeline() -> None:
 
             logger.info("%s layer is available", layer)
 
-        # 13. Record successful execution.
+        # 13. Upload completed local outputs before advancing incremental state.
+        upload_outputs()
+
+        if incremental_enabled:
+            newly_processed_ids = set(
+                new_orders[incremental_key].astype(str)
+            )
+
+            save_processed_ids(
+                state_file,
+                processed_ids | newly_processed_ids,
+            )
+
+        # 14. Record successful execution.
         finish_run_record(run_record, "success")
         save_run_record(run_record, history_file)
 
