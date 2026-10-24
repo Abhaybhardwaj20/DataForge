@@ -141,6 +141,7 @@ Keep `.env` untracked. It is ignored by `.gitignore`; do not force-add or commit
 From the project root, start RustFS and run the pipeline:
 
 ```powershell
+docker compose build dataforge
 docker compose up -d object-storage
 docker compose run --rm dataforge
 ```
